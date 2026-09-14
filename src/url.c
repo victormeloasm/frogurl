@@ -1,6 +1,7 @@
 #include "frogurl.h"
 
 #include <ctype.h>
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +33,7 @@ int url_parse(const char *s, Url *u, char **err) {
     }
     const char *p = strstr(clean, "://");
     if (!p || p == clean) {
-        if (err) *err = xstrdup("URL must include http:// or https://");
+        if (err) *err = xstrdup("URL must include http://, https:// or ftp://");
         free(clean);
         return -1;
     }
@@ -46,13 +47,14 @@ int url_parse(const char *s, Url *u, char **err) {
     char *scheme_raw = xstrndup(clean, (size_t)(p - clean));
     u->scheme = strlower_dup(scheme_raw);
     free(scheme_raw);
-    if (!strieq(u->scheme, "http") && !strieq(u->scheme, "https")) {
-        if (err) *err = xstrdup("only http and https are supported");
+    if (!strieq(u->scheme, "http") && !strieq(u->scheme, "https") && !strieq(u->scheme, "ftp")) {
+        if (err) *err = xstrdup("only http, https and ftp are supported");
         free(clean);
         url_free(u);
         return -1;
     }
     u->https = strieq(u->scheme, "https");
+    u->ftp = strieq(u->scheme, "ftp");
 
     const char *auth = p + 3;
     const char *path = strpbrk(auth, "/?");
@@ -79,6 +81,11 @@ int url_parse(const char *s, Url *u, char **err) {
             return -1;
         }
         u->host = xstrndup(auth + 1, (size_t)(rb - auth - 1));
+        unsigned char addr[16];
+        if (inet_pton(AF_INET6, u->host, addr) != 1) {
+            if (err) *err = xstrdup("invalid IPv6 literal");
+            free(clean); url_free(u); return -1;
+        }
         if (rb + 1 < auth_end) {
             if (rb[1] != ':') {
                 if (err) *err = xstrdup("invalid authority after IPv6 host");
@@ -107,7 +114,16 @@ int url_parse(const char *s, Url *u, char **err) {
         url_free(u);
         return -1;
     }
-    if (!u->port) u->port = xstrdup(u->https ? "443" : "80");
+    if (*auth != '[') {
+        for (const unsigned char *q = (const unsigned char *)u->host; *q; ++q) {
+            if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+                  (*q >= '0' && *q <= '9') || *q == '-' || *q == '.' || *q == '_')) {
+                if (err) *err = xstrdup("invalid host; use bracketed IPv6 or an ASCII hostname");
+                free(clean); url_free(u); return -1;
+            }
+        }
+    }
+    if (!u->port) u->port = xstrdup(u->ftp ? "21" : (u->https ? "443" : "80"));
     if (!*u->port) {
         if (err) *err = xstrdup("empty port");
         free(clean);
@@ -120,6 +136,14 @@ int url_parse(const char *s, Url *u, char **err) {
         url_free(u);
         return -1;
     }
+    unsigned long long port;
+    if (parse_decimal(u->port, 65535, &port) || !port) {
+        if (err) *err = xstrdup("port must be between 1 and 65535");
+        free(clean); url_free(u); return -1;
+    }
+    char canonical_port[6];
+    snprintf(canonical_port, sizeof(canonical_port), "%u", (unsigned)port);
+    free(u->port); u->port = xstrdup(canonical_port);
 
     if (!path) u->path = xstrdup("/");
     else if (*path == '?') {
@@ -147,7 +171,7 @@ static int host_needs_brackets(const char *host) {
 }
 
 char *url_host_header(const Url *u) {
-    int default_port = (!u->https && !strcmp(u->port, "80")) || (u->https && !strcmp(u->port, "443"));
+    int default_port = !strcmp(u->port, u->ftp ? "21" : (u->https ? "443" : "80"));
     int brackets = host_needs_brackets(u->host);
     size_t n = strlen(u->host) + strlen(u->port) + 8;
     char *s = xmalloc(n);
@@ -172,12 +196,19 @@ static char *normalize_path(const char *path) {
     char **stack = xcalloc(plen + 1, sizeof(char*));
     size_t top = 0;
 
-    char *save = NULL;
-    for (char *tok = strtok_r(work, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
-        if (!strcmp(tok, ".") || !*tok) continue;
-        if (!strcmp(tok, "..")) {
+    /* Keep empty segments: /a//b and /a/b can identify different resources. */
+    char *part = work + (work[0] == '/');
+    for (;;) {
+        char *slash = strchr(part, '/');
+        if (slash) *slash = 0;
+        if (!strcmp(part, ".")) {
+            if (!slash) stack[top++] = part + 1;
+        } else if (!strcmp(part, "..")) {
             if (top) --top;
-        } else stack[top++] = tok;
+            if (!slash) stack[top++] = part + 2;
+        } else stack[top++] = part;
+        if (!slash) break;
+        part = slash + 1;
     }
 
     size_t cap = plen + (qmark ? strlen(qmark) : 0) + 3;
@@ -190,7 +221,6 @@ static char *normalize_path(const char *path) {
         pos += n;
         if (i + 1 < top) out[pos++] = '/';
     }
-    if (plen > 1 && path[plen - 1] == '/' && pos > 1) out[pos++] = '/';
     if (qmark) {
         size_t n = strlen(qmark);
         memcpy(out + pos, qmark, n);
@@ -204,6 +234,7 @@ static char *normalize_path(const char *path) {
 
 char *url_resolve(const Url *base, const char *location) {
     if (!location || !*location) return url_to_string(base);
+    if (*location == '#') return url_to_string(base);
     if (strstr(location, "://")) return strip_fragment(location);
 
     if (!strncmp(location, "//", 2)) {

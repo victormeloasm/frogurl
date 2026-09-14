@@ -5,20 +5,20 @@
 <h1 align="center">frogurl</h1>
 
 <p align="center">
-  <strong>A small, auditable HTTP/HTTPS command-line client written in C.</strong>
+  <strong>A small, auditable HTTP/HTTPS/FTP command-line client written in C.</strong>
 </p>
 
 <p align="center">
-  Familiar curl-style options, modern TLS through OpenSSL, streaming I/O, redirects, proxies, compression, and a tiny implementation focused only on the web protocols most people actually use.
+  Familiar curl-style options, modern TLS through OpenSSL, streaming I/O, redirects, proxies, compression, and a compact implementation with binary passive FTP transfers.
 </p>
 
 ---
 
 ## Overview
 
-`frogurl` is a lightweight command-line HTTP/HTTPS client for users who want a smaller and easier-to-audit alternative for common web requests.
+`frogurl` is a lightweight command-line HTTP/HTTPS/FTP client for users who want a smaller and easier-to-audit alternative for common web requests.
 
-It deliberately focuses on **HTTP/1.1 and HTTPS** instead of trying to reproduce curl's very large protocol and feature surface.
+It deliberately focuses on **HTTP/1.1, HTTPS and binary passive FTP** instead of trying to reproduce curl's very large protocol and feature surface.
 
 The implementation uses:
 
@@ -34,6 +34,40 @@ The result is a compact native client that remains useful for real downloads, AP
 ---
 
 ## Features
+
+### FTP (v1.2)
+
+- `ftp://` downloads with RETR and uploads with `-T` / STOR
+- Binary transfers (`TYPE I`), streamed with bounded buffers
+- Anonymous login by default, or `-u USER:PASS`
+- EPSV for IPv4/IPv6; PASV fallback for IPv4
+- Data connections pinned to the actual control peer, ignoring the IP advertised in PASV
+- `-o FILE`, `-O`, progress, timeouts and final transfer metadata
+- Percent-encoded path components and optional `;type=i`
+- File upload and `-T -` for stdin
+
+```sh
+frogurl -O ftp://example.com/archive.tar.gz
+frogurl -u user:pass -o local.bin ftp://example.com/folder/file.bin
+frogurl -u user:pass -T local.bin ftp://example.com/folder/file.bin
+cat local.bin | frogurl -u user:pass -T - ftp://example.com/folder/file.bin
+frogurl --json-meta -o local.bin ftp://example.com/file.bin
+```
+
+FTP paths are relative to the login directory: `/folder/file` changes into `folder`
+and transfers `file`. Use `//folder/file` or `/%2Ffolder/file` for an absolute server
+path. Empty interior directory components (such as `/dir//file`) are rejected.
+The URL must include a filename; directory listings and automatic upload
+basename selection are not implemented. FTP credentials in URLs are rejected; use `-u`.
+
+Plain FTP does not encrypt credentials or file contents. This version implements
+neither FTPS nor SFTP. FTP rejects HTTP/TLS options such as `-X`, `-H`, `-I`, `-d`,
+`-L`, `-x`, `-k` and `--compressed` instead of silently ignoring them.
+
+For FTP, `--status`, `--meta` and `--json-meta` perform the transfer and report the
+final 226/250 completion status. With no output option, metadata mode discards the
+received data. `-o`/`-O` save data while metadata goes to stdout. FTP failures return
+1 even without `-f`; `-f` retains its existing HTTP-specific exit-22 behavior.
 
 ### HTTP and networking
 
@@ -164,7 +198,13 @@ Additional supported long options include:
 
 ## Download
 
-### Linux x86_64 — v1.1
+### Included build — v1.2
+
+This source package includes the tested `frogurl` Linux x86_64 executable. See
+`BUILD_INFO.txt` for compiler, dependencies and measured sizes, and `AUDIT.md` for
+fixes and validation. Version 1.2 has not been published to the GitHub release URL below.
+
+### Previous published Linux x86_64 release — v1.1
 
 Download the prebuilt release:
 
@@ -239,6 +279,22 @@ Size-oriented release build:
 ```sh
 make release
 ```
+
+Both GCC and Clang are supported. `pkg-config` is used when available; otherwise
+standard OpenSSL/zlib linker flags are used. Release builds retain PIE, stack
+protection, FORTIFY, full RELRO and a non-executable stack.
+
+Validation (Python 3 and the OpenSSL CLI are also required):
+
+```sh
+make test           # HTTP, HTTPS, proxy, FTP and security regressions
+make fuzz-smoke     # deterministic parser mutation checks
+make sanitize      # rebuild and run tests with ASan + UBSan
+```
+
+On hosts where LeakSanitizer cannot inspect `/proc` (including this build environment),
+use `ASAN_OPTIONS=detect_leaks=0 make sanitize`; address and undefined-behavior checks
+remain enabled. Rebuild with `make release` after testing.
 
 The exact binary size depends on compiler version, linker, stripping, LTO, enabled hardening, and the target system.
 
@@ -562,7 +618,8 @@ This keeps memory use mostly independent of download size.
 
 Currently out of scope:
 
-- FTP
+- FTPS
+- FTP active mode, directory listing, resume, proxies and ASCII transfer mode
 - SFTP
 - SCP
 - SMTP
@@ -592,9 +649,30 @@ Current security-oriented behavior includes:
 - hostname/IP verification for HTTPS
 - system CA trust by default
 - explicit `-k` required to disable certificate checks
-- authorization values redacted from verbose output
+- HTTP authorization/cookie values and outgoing FTP login arguments redacted from verbose output
 - streaming response handling rather than blindly allocating based on remote object size
-- bounded redirect handling
+- bounded redirect handling; Authorization, Cookie and custom Host values are not forwarded across origins
+- HTTP redirects cannot switch to FTP
+- `-O` uses the original HTTP URL basename, so redirects cannot change the local target
+- `-O` refuses symlinks, multiply linked files and non-regular outputs
+- strict header/framing, chunk, numeric-port and decoded FTP argument validation
+- bounded HTTP interim replies, headers, trailers and FTP multiline replies
+- complete gzip/deflate validation, including gzip checksums and concatenated gzip members
+- TLS handshake/read/write deadlines and rejection of unclean TLS EOF
+
+Ambiguous or unsupported HTTP framing/encoding is rejected rather than guessed.
+For HTTP, metadata without an output option retains the metadata-only behavior;
+with `-o`/`-O`, the body is now downloaded as well.
+
+`--connect-timeout` limits each TCP connection attempt, but the synchronous system
+DNS resolver is outside that deadline. `--timeout` is a socket-operation timeout,
+not a total transfer deadline: a peer that keeps making progress can keep a
+transfer open. Local stdin reads are not covered by the socket timeout.
+
+On transfer failure, a partially written output file can remain and must not be
+treated as a successful download. Explicit `-o` paths can still follow symlinks;
+only the automatic `-O` path applies the stricter inode checks. The program does
+not impose a total download/decompression size quota.
 
 For security-sensitive deployments, building and testing with compiler sanitizers and fuzzing the URL, HTTP-header, redirect, chunked-transfer, and decompression paths is recommended.
 
@@ -606,7 +684,7 @@ For security-sensitive deployments, building and testing with compiler sanitizer
 
 `frogurl` has a different goal:
 
-> **Do the common HTTP/HTTPS jobs well, with less code and less surface area.**
+> **Keep common HTTP/HTTPS requests and FTP transfers small and easy to inspect.**
 
 It is intended for:
 

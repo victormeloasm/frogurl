@@ -1,0 +1,45 @@
+frogurl tests: OK
+test_ftp_auth_and_redaction (__main__.ProtocolTests.test_ftp_auth_and_redaction) ... ok
+test_ftp_bad_passive_ports (__main__.ProtocolTests.test_ftp_bad_passive_ports) ... ok
+test_ftp_bad_size_and_completion (__main__.ProtocolTests.test_ftp_bad_size_and_completion) ... ok
+test_ftp_download_and_metadata (__main__.ProtocolTests.test_ftp_download_and_metadata) ... ok
+test_ftp_ipv6 (__main__.ProtocolTests.test_ftp_ipv6) ... ok
+test_ftp_no_size_and_empty (__main__.ProtocolTests.test_ftp_no_size_and_empty) ... ok
+test_ftp_output_and_metadata (__main__.ProtocolTests.test_ftp_output_and_metadata) ... ok
+test_ftp_pasv_pins_peer (__main__.ProtocolTests.test_ftp_pasv_pins_peer) ... ok
+test_ftp_paths_and_names (__main__.ProtocolTests.test_ftp_paths_and_names) ... ok
+test_ftp_rejects_bad_names_and_options (__main__.ProtocolTests.test_ftp_rejects_bad_names_and_options) ... ok
+test_ftp_rejects_injection (__main__.ProtocolTests.test_ftp_rejects_injection) ... ok
+test_ftp_reply_bounds (__main__.ProtocolTests.test_ftp_reply_bounds) ... ok
+test_ftp_upload_file_and_stdin (__main__.ProtocolTests.test_ftp_upload_file_and_stdin) ... ok
+test_http_bad_chunks_and_trailers (__main__.ProtocolTests.test_http_bad_chunks_and_trailers) ... ok
+test_http_compression_integrity (__main__.ProtocolTests.test_http_compression_integrity) ... ok
+test_http_cross_origin_credentials (__main__.ProtocolTests.test_http_cross_origin_credentials) ... ok
+test_http_framing_rejection (__main__.ProtocolTests.test_http_framing_rejection) ... ok
+test_http_header_injection (__main__.ProtocolTests.test_http_header_injection) ... ok
+test_http_interim_and_header_bounds (__main__.ProtocolTests.test_http_interim_and_header_bounds) ... ok
+test_http_long_reason_no_stack_disclosure (__main__.ProtocolTests.test_http_long_reason_no_stack_disclosure) ... ok
+test_http_metadata_file (__main__.ProtocolTests.test_http_metadata_file) ... ok
+test_http_proxy_credentials_not_origin (__main__.ProtocolTests.test_http_proxy_credentials_not_origin) ... ok
+test_http_redirect_body_headers (__main__.ProtocolTests.test_http_redirect_body_headers) ... ok
+test_http_redirect_no_ftp (__main__.ProtocolTests.test_http_redirect_no_ftp) ... ok
+test_http_redirect_path_semantics (__main__.ProtocolTests.test_http_redirect_path_semantics) ... ok
+test_http_redirect_stdin_replay_rejected (__main__.ProtocolTests.test_http_redirect_stdin_replay_rejected) ... ok
+test_http_remote_name_not_redirect_controlled (__main__.ProtocolTests.test_http_remote_name_not_redirect_controlled) ... ok
+test_http_request_framing (__main__.ProtocolTests.test_http_request_framing) ... ok
+test_http_truncated_length (__main__.ProtocolTests.test_http_truncated_length) ... ok
+test_https_certificate_validation (__main__.ProtocolTests.test_https_certificate_validation) ... ok
+test_https_connect_default_port (__main__.ProtocolTests.test_https_connect_default_port) ... ok
+test_https_hostname_mismatch (__main__.ProtocolTests.test_https_hostname_mismatch) ... ok
+test_numeric_options_and_bad_urls (__main__.ProtocolTests.test_numeric_options_and_bad_urls) ... ok
+test_output_failure (__main__.ProtocolTests.test_output_failure) ... ok
+test_proxy_bounds (__main__.ProtocolTests.test_proxy_bounds) ... ok
+test_remote_name_symlink_and_hardlink (__main__.ProtocolTests.test_remote_name_symlink_and_hardlink) ... ok
+test_tls_handshake_and_read_timeout (__main__.ProtocolTests.test_tls_handshake_and_read_timeout) ... ok
+test_tls_unclean_eof (__main__.ProtocolTests.test_tls_unclean_eof) ... ok
+test_tls_write_timeout (__main__.ProtocolTests.test_tls_write_timeout) ... ok
+
+----------------------------------------------------------------------
+Ran 39 tests in 19.059s
+
+OK

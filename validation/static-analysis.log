@@ -1,0 +1,7 @@
+src/ftp.c: exit 0
+src/http.c: exit 0
+src/main.c: exit 0
+src/net.c: exit 0
+src/progress.c: exit 0
+src/url.c: exit 0
+src/util.c: exit 0

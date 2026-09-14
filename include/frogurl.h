@@ -17,6 +17,7 @@ typedef struct {
     char *port;
     char *path;
     int https;
+    int ftp;
     int explicit_port;
 } Url;
 
@@ -48,6 +49,7 @@ typedef struct {
     SSL *ssl;
     int tls;
     int verbose;
+    int io_timeout_ms;
     unsigned char rbuf[16384];
     size_t rpos;
     size_t rlen;
@@ -97,10 +99,16 @@ typedef struct {
     int progress_bar;
     int no_progress_meter;
     int strip_authorization; /* internal: do not forward credentials across origins */
+    int strip_body_headers;
 } Options;
 
+typedef struct {
+    int enabled;
+    long long total, done, start_ms, last_ms;
+} Progress;
+
 /* util.c */
-void die(const char *fmt, ...);
+_Noreturn void die(const char *fmt, ...);
 void *xmalloc(size_t n);
 void *xcalloc(size_t n, size_t s);
 char *xstrdup(const char *s);
@@ -113,6 +121,13 @@ char *base64_basic(const char *s);
 int write_all_fd(int fd, const void *buf, size_t len);
 char *json_escape(const char *s);
 long long monotonic_ms(void);
+int parse_decimal(const char *s, unsigned long long max, unsigned long long *out);
+int valid_token(const char *s);
+int valid_field_value(const char *s);
+int parse_http_status(const char *line, int *status);
+void progress_render(Progress *p, int final);
+void progress_add(Progress *p, size_t n);
+int output_open(const char *path, int remote_name, char **err);
 
 /* url.c */
 int url_parse(const char *s, Url *u, char **err);
@@ -124,6 +139,7 @@ char *url_remote_name(const Url *u);
 
 /* net.c */
 int conn_open(Connection *c, const Url *target, const Url *proxy, const Options *opt, char **err);
+int conn_open_peer(Connection *c, const Connection *control, unsigned port, const Options *opt, char **err);
 ssize_t conn_read_raw(Connection *c, void *buf, size_t len);
 int conn_write_all(Connection *c, const void *buf, size_t len);
 ssize_t conn_read(Connection *c, void *buf, size_t len);
@@ -137,5 +153,6 @@ int header_exists(const Header *list, const char *name);
 void headers_free(Header *h);
 void response_free(Response *r);
 int http_transaction(const Url *url, const Options *opt, Response *resp, char **effective_url, char **err);
+int ftp_transaction(const Url *url, const Options *opt, Response *resp, char **effective_url, char **err);
 
 #endif

@@ -1,0 +1,44 @@
+[
+  {
+    "build": "original",
+    "case": "long_status_exact_output",
+    "ok": false,
+    "exit": 0
+  },
+  {
+    "build": "original",
+    "case": "truncated_gzip_rejected",
+    "ok": false
+  },
+  {
+    "build": "original",
+    "case": "header_injection_rejected",
+    "ok": false
+  },
+  {
+    "build": "original",
+    "case": "redirect_cannot_choose_local_name",
+    "ok": false
+  },
+  {
+    "build": "updated",
+    "case": "long_status_exact_output",
+    "ok": true,
+    "exit": 0
+  },
+  {
+    "build": "updated",
+    "case": "truncated_gzip_rejected",
+    "ok": true
+  },
+  {
+    "build": "updated",
+    "case": "header_injection_rejected",
+    "ok": true
+  },
+  {
+    "build": "updated",
+    "case": "redirect_cannot_choose_local_name",
+    "ok": true
+  }
+]

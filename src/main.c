@@ -2,6 +2,8 @@
 
 #include <errno.h>
 #include <getopt.h>
+#include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +11,7 @@
 
 static void usage(FILE *f) {
     fprintf(f,
-"frogurl - small HTTP/HTTPS command-line client\n"
+"frogurl - small HTTP/HTTPS/FTP command-line client\n"
 "\n"
 "Usage: frogurl [options] URL\n"
 "\n"
@@ -19,7 +21,7 @@ static void usage(FILE *f) {
 "  -H, --header 'Name: value'  Add request header (repeatable)\n"
 "  -d, --data DATA              Send DATA (defaults method to POST)\n"
 "      --data-binary DATA       Send exact DATA, @FILE, or @- for stdin\n"
-"  -T, --upload-file FILE       Upload FILE (defaults method to PUT)\n"
+"  -T, --upload-file FILE       Upload FILE, or - for stdin (HTTP PUT / FTP STOR)\n"
 "  -o, --output FILE            Write response body to FILE\n"
 "  -O, --remote-name            Save using the remote path basename\n"
 "  -L, --location               Follow redirects\n"
@@ -28,7 +30,7 @@ static void usage(FILE *f) {
 "Connection/TLS:\n"
 "  -x, --proxy URL              HTTP proxy URL\n"
 "      --proxy-user USER:PASS   Basic proxy credentials\n"
-"  -u, --user USER:PASS         HTTP Basic credentials\n"
+"  -u, --user USER:PASS         HTTP Basic or FTP login (default: anonymous FTP)\n"
 "  -k, --insecure               Disable TLS certificate verification\n"
 "      --cacert FILE            CA bundle/file for TLS verification\n"
 "      --connect-timeout SEC    TCP connect timeout (default: 10)\n"
@@ -43,7 +45,7 @@ static void usage(FILE *f) {
 "  -v, --verbose                Verbose connection and HTTP trace\n"
 "  -#, --progress-bar           Display transfer progress as a bar\n"
 "      --no-progress-meter     Disable transfer progress display\n"
-"      --status                 Print only final HTTP status code\n"
+"      --status                 Print only final HTTP/FTP status code\n"
 "      --meta                   Print final response metadata\n"
 "      --json-meta              Print metadata as JSON\n"
 "      --version                Show version\n"
@@ -55,22 +57,28 @@ static void usage(FILE *f) {
 "  frogurl -H 'Accept: application/json' https://example.com/api\n"
 "  frogurl -d 'frog=green' https://example.com/form\n"
 "  frogurl --data-binary @payload.bin -X POST https://example.com/upload\n"
-"  frogurl -x http://127.0.0.1:8080 https://example.com\n");
+"  frogurl -x http://127.0.0.1:8080 https://example.com\n"
+"  frogurl -u user:pass -O ftp://example.com/file.zip\n"
+"  frogurl -u user:pass -T file.zip ftp://example.com/file.zip\n"
+"\nFTP: binary passive transfers (EPSV / IPv4 PASV); no FTPS or SFTP.\n");
 }
 
 static int parse_seconds_ms(const char *s, int *out) {
     char *end = NULL;
     errno = 0;
     double v = strtod(s, &end);
-    if (errno || end == s || *end || v < 0 || v > 2147483.0) return -1;
+    if (errno || end == s || *end || !isfinite(v) || v < 0 || v > 2147483.0) return -1;
     *out = (int)(v * 1000.0 + 0.5);
+    if (v > 0 && *out == 0) *out = 1;
     return 0;
 }
 
 static void parse_header_arg(Header **headers, const char *arg) {
+    if (!valid_field_value(arg)) die("frogurl: invalid control character in header");
     const char *colon = strchr(arg, ':');
     if (!colon || colon == arg) die("frogurl: invalid header '%s' (expected Name: value)", arg);
     char *name = xstrndup(arg, (size_t)(colon - arg));
+    if (!valid_token(name)) die("frogurl: invalid header name");
     char *value = trim_dup(colon + 1);
     header_add(headers, name, value);
     free(name); free(value);
@@ -112,6 +120,7 @@ static void set_binary_body(Options *o, const char *arg) {
 
 static void set_upload_file(Options *o, const char *path) {
     if (o->body.type != BODY_NONE) die("frogurl: only one request body source may be used");
+    if (!strcmp(path, "-")) { o->body.type = BODY_STDIN; return; }
     struct stat st;
     if (stat(path, &st) != 0) die("frogurl: cannot stat '%s': %s", path, strerror(errno));
     if (!S_ISREG(st.st_mode)) die("frogurl: upload source '%s' is not a regular file", path);
@@ -144,12 +153,13 @@ static void print_json_meta(const Response *r, const char *effective) {
 }
 
 int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
     Options o;
     memset(&o, 0, sizeof(o));
     o.max_redirects = 10;
     o.connect_timeout_ms = 10000;
     o.io_timeout_ms = 30000;
-    o.user_agent = "frogurl/1.1";
+    o.user_agent = "frogurl/1.2";
 
     int method_explicit = 0;
     int head = 0;
@@ -217,8 +227,8 @@ int main(int argc, char **argv) {
             case 'O': o.remote_name = 1; break;
             case 'L': o.follow_redirects = 1; break;
             case OPT_MAX_REDIRS: {
-                char *e = NULL; long v = strtol(optarg, &e, 10);
-                if (!e || *e || v < 0 || v > 1000) die("frogurl: invalid --max-redirs value");
+                unsigned long long v;
+                if (parse_decimal(optarg, 1000, &v)) die("frogurl: invalid --max-redirs value");
                 o.max_redirects = (int)v; break;
             }
             case 'x': o.proxy = optarg; break;
@@ -244,7 +254,7 @@ int main(int argc, char **argv) {
             case OPT_JSON_META: o.json_meta = 1; break;
             case OPT_NO_PROGRESS_METER: o.no_progress_meter = 1; break;
             case OPT_VERSION:
-                puts("frogurl 1.1 (HTTP/1.1, OpenSSL, zlib)");
+                puts("frogurl 1.2 (HTTP/1.1, HTTPS, passive FTP, OpenSSL, zlib)");
                 return 0;
             case 'h': usage(stdout); return 0;
             default: usage(stderr); return 2;
@@ -266,6 +276,8 @@ int main(int argc, char **argv) {
         if (o.body.type == BODY_NONE) o.method = "GET";
         else o.method = upload_defaults_put ? "PUT" : "POST";
     }
+    if (!valid_token(o.method) || !valid_field_value(o.user_agent))
+        die("frogurl: invalid method or User-Agent");
 
     Url url;
     char *err = NULL;
@@ -273,13 +285,26 @@ int main(int argc, char **argv) {
         fprintf(stderr, "frogurl: %s\n", err ? err : "invalid URL");
         free(err);
         headers_free(o.headers);
+        free((void *)o.body.mem);
+        free(o.body.file_path);
         return 3;
     }
+
+    if (url.ftp && (method_explicit || head || o.headers || o.proxy || o.proxy_auth ||
+                   o.insecure || o.cacert || o.compressed || o.include_headers || o.follow_redirects ||
+                   strcmp(o.user_agent, "frogurl/1.2") ||
+                   (o.body.type != BODY_NONE && !upload_defaults_put)))
+        die("frogurl: FTP supports -u, -T, -o/-O, timeouts, progress and metadata; HTTP/TLS options are not supported");
 
     Response r;
     memset(&r, 0, sizeof(r));
     char *effective = NULL;
-    int rc = http_transaction(&url, &o, &r, &effective, &err);
+    /* A redirect must not choose a different local file for -O. */
+    char *remote_output = o.remote_name && !url.ftp ? url_remote_name(&url) : NULL;
+    if (remote_output) o.output_path = remote_output;
+    int rc = url.ftp ? ftp_transaction(&url, &o, &r, &effective, &err)
+                     : http_transaction(&url, &o, &r, &effective, &err);
+    free(remote_output);
     url_free(&url);
 
     if (rc != 0) {

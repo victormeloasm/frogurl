@@ -2,12 +2,14 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
-void die(const char *fmt, ...) {
+_Noreturn void die(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -148,4 +150,56 @@ long long monotonic_ms(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+int parse_decimal(const char *s, unsigned long long max, unsigned long long *out) {
+    unsigned long long n = 0;
+    if (!s || !*s) return -1;
+    for (; *s; ++s) {
+        if (*s < '0' || *s > '9') return -1;
+        unsigned d = (unsigned)(*s - '0');
+        if (d > max || n > (max - d) / 10) return -1;
+        n = n * 10 + d;
+    }
+    *out = n;
+    return 0;
+}
+
+int valid_token(const char *s) {
+    if (!s || !*s) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || strchr("!#$%&'*+-.^_`|~", *p))) return 0;
+    return 1;
+}
+
+int valid_field_value(const char *s) {
+    if (!s) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
+        if ((*p < 32 && *p != '\t') || *p == 127) return 0;
+    return 1;
+}
+
+int parse_http_status(const char *line, int *status) {
+    if (strlen(line) < 13 || (strncmp(line, "HTTP/1.0 ", 9) && strncmp(line, "HTTP/1.1 ", 9)) ||
+        line[9] < '1' || line[9] > '5' || line[10] < '0' || line[10] > '9' ||
+        line[11] < '0' || line[11] > '9' ||
+        (line[12] != ' ' && line[12] != '\r' && line[12] != '\n')) return -1;
+    *status = 100 * (line[9] - '0') + 10 * (line[10] - '0') + line[11] - '0';
+    return 0;
+}
+
+int output_open(const char *path, int remote_name, char **err) {
+    int flags = O_CREAT | O_WRONLY;
+    /* Check the opened inode before truncating automatic download names. */
+    flags |= remote_name ? (O_NOFOLLOW | O_NONBLOCK) : O_TRUNC;
+    int fd = open(path, flags, 0666);
+    if (fd < 0) { *err = xstrdup("cannot open output file"); return -1; }
+    if (remote_name) {
+        struct stat st;
+        if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 || ftruncate(fd, 0)) {
+            close(fd); *err = xstrdup("unsafe or unwritable -O output (requires a regular file with one link)"); return -1;
+        }
+    }
+    return fd;
 }

@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,12 +56,14 @@ static void sb_printf(StrBuf *b, const char *fmt, ...) {
 }
 
 static char *fmt_err(const char *fmt, ...) {
+    if (!fmt) die("frogurl: missing diagnostic format");
     va_list ap;
     va_start(ap, fmt);
     va_list aq;
     va_copy(aq, ap);
     int n = vsnprintf(NULL, 0, fmt, aq);
     va_end(aq);
+    if (n < 0) { va_end(ap); return xstrdup("diagnostic formatting failed"); }
     char *s = xmalloc((size_t)n + 1);
     vsnprintf(s, (size_t)n + 1, fmt, ap);
     va_end(ap);
@@ -125,46 +128,48 @@ static int contains_token_ci(const char *s, const char *tok) {
 }
 
 static int parse_status_and_headers(Connection *c, Response *r, const Options *opt, char **err) {
-    for (;;) {
+    for (unsigned interim = 0;; ++interim) {
+        if (interim >= 16) { *err = xstrdup("too many interim HTTP responses"); return -1; }
         char *line = NULL;
         int rr = conn_read_line(c, &line, 65536);
         if (rr <= 0) { *err = xstrdup("server closed connection before response status"); return -1; }
         if (opt->verbose) fprintf(stderr, "< %s", line);
 
         int status = 0;
-        char *sp1 = strchr(line, ' ');
-        if (!sp1 || strncmp(line, "HTTP/", 5) || sscanf(sp1 + 1, "%d", &status) != 1) {
-            free(line);
-            *err = xstrdup("invalid HTTP status line");
-            return -1;
+        if (parse_http_status(line, &status)) {
+            free(line); *err = xstrdup("invalid HTTP status line"); return -1;
         }
-        char *sp2 = strchr(sp1 + 1, ' ');
-        char *reason = sp2 ? trim_dup(sp2 + 1) : xstrdup("");
-        size_t rn = strlen(reason);
-        while (rn && (reason[rn - 1] == '\r' || reason[rn - 1] == '\n')) reason[--rn] = 0;
+        char *reason = trim_dup(line + 12);
         free(line);
 
         Header *headers = NULL;
-        size_t header_bytes = 0;
+        size_t header_bytes = 0, header_count = 0;
         for (;;) {
             line = NULL;
             rr = conn_read_line(c, &line, 65536);
             if (rr <= 0) { free(line); headers_free(headers); free(reason); *err = xstrdup("truncated HTTP headers"); return -1; }
             header_bytes += strlen(line);
-            if (header_bytes > 1024 * 1024) {
+            if (header_bytes > 1024 * 1024 || ++header_count > 1024) {
                 free(line); headers_free(headers); free(reason);
-                *err = xstrdup("HTTP response headers exceed 1 MiB");
+                *err = xstrdup("HTTP response headers exceed size/count limit");
                 return -1;
             }
             if (opt->verbose) fprintf(stderr, "< %s", line);
             if (!strcmp(line, "\r\n") || !strcmp(line, "\n")) { free(line); break; }
             char *colon = strchr(line, ':');
-            if (!colon) { free(line); continue; }
-            *colon = 0;
-            char *name = trim_dup(line);
+            if (colon) *colon = 0;
+            if (!colon || !valid_token(line)) {
+                free(line); headers_free(headers); free(reason);
+                *err = xstrdup("invalid HTTP header name"); return -1;
+            }
+            char *name = xstrdup(line);
             char *value = trim_dup(colon + 1);
             size_t vn = strlen(value);
             while (vn && (value[vn - 1] == '\r' || value[vn - 1] == '\n')) value[--vn] = 0;
+            if (!valid_field_value(value)) {
+                free(name); free(value); free(line); headers_free(headers); free(reason);
+                *err = xstrdup("invalid HTTP header value"); return -1;
+            }
             header_add(&headers, name, value);
             free(name); free(value); free(line);
         }
@@ -182,17 +187,31 @@ static int parse_status_and_headers(Connection *c, Response *r, const Options *o
         break;
     }
 
+    if (r->status == 101) { *err = xstrdup("HTTP protocol upgrades are not supported"); return -1; }
     const char *v;
-    if ((v = header_get(r->headers, "Content-Length"))) {
-        char *end = NULL;
-        errno = 0;
-        long long n = strtoll(v, &end, 10);
-        if (!errno && end != v && n >= 0) { r->content_length = n; r->has_content_length = 1; }
+    unsigned cl = 0, te = 0, ce = 0;
+    for (Header *h = r->headers; h; h = h->next) {
+        cl += strieq(h->name, "Content-Length");
+        te += strieq(h->name, "Transfer-Encoding");
+        ce += strieq(h->name, "Content-Encoding");
     }
-    if ((v = header_get(r->headers, "Transfer-Encoding"))) r->chunked = contains_token_ci(v, "chunked");
+    if (cl > 1 || te > 1 || ce > 1 || (cl && te)) {
+        *err = xstrdup("ambiguous or duplicate HTTP framing/encoding headers"); return -1;
+    }
+    if ((v = header_get(r->headers, "Content-Length"))) {
+        unsigned long long n;
+        if (parse_decimal(v, LLONG_MAX, &n)) { *err = xstrdup("invalid HTTP Content-Length"); return -1; }
+        r->content_length = (long long)n; r->has_content_length = 1;
+    }
+    if ((v = header_get(r->headers, "Transfer-Encoding"))) {
+        if (!strieq(v, "chunked")) { *err = xstrdup("unsupported HTTP Transfer-Encoding"); return -1; }
+        r->chunked = 1;
+    }
     if ((v = header_get(r->headers, "Content-Encoding"))) {
-        r->gzip = contains_token_ci(v, "gzip");
-        r->deflate = contains_token_ci(v, "deflate");
+        r->gzip = strieq(v, "gzip"); r->deflate = strieq(v, "deflate");
+        if (opt->compressed && !r->gzip && !r->deflate && !strieq(v, "identity")) {
+            *err = xstrdup("unsupported HTTP Content-Encoding"); return -1;
+        }
     }
     if ((v = header_get(r->headers, "Connection"))) r->connection_close = contains_token_ci(v, "close");
     if ((v = header_get(r->headers, "Location"))) r->location = xstrdup(v);
@@ -201,9 +220,14 @@ static int parse_status_and_headers(Connection *c, Response *r, const Options *o
     return 0;
 }
 
-static int send_file_body(Connection *c, const char *path, int chunked, char **err) {
-    int fd = open(path, O_RDONLY);
+static int send_file_body(Connection *c, const char *path, int chunked, off_t expected, char **err) {
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) { *err = fmt_err("cannot open request body file '%s': %s", path, strerror(errno)); return -1; }
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size != expected) {
+        close(fd); *err = xstrdup("request body file changed before upload"); return -1;
+    }
+    off_t sent = 0;
     unsigned char buf[16384];
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
@@ -213,6 +237,8 @@ static int send_file_body(Connection *c, const char *path, int chunked, char **e
             close(fd); return -1;
         }
         if (!n) break;
+        if (n > expected - sent) { close(fd); *err = xstrdup("request body file grew during upload"); return -1; }
+        sent += n;
         if (chunked) {
             char head[32];
             int hn = snprintf(head, sizeof(head), "%zx\r\n", (size_t)n);
@@ -224,6 +250,7 @@ static int send_file_body(Connection *c, const char *path, int chunked, char **e
         }
     }
     close(fd);
+    if (sent != expected) { *err = xstrdup("request body file shrank during upload"); return -1; }
     if (chunked && conn_write_all(c, "0\r\n\r\n", 5)) { *err = xstrdup("failed to finish chunked request body"); return -1; }
     return 0;
 }
@@ -248,6 +275,24 @@ static int send_stdin_body(Connection *c, char **err) {
 }
 
 static int send_request(Connection *c, const Url *u, const Url *proxy, const Options *opt, const char *method, char **err) {
+    unsigned cl = 0, te = 0, host_count = 0;
+    for (Header *h = opt->headers; h; h = h->next) {
+        cl += strieq(h->name, "Content-Length");
+        te += strieq(h->name, "Transfer-Encoding");
+        host_count += strieq(h->name, "Host");
+    }
+    if (!opt->strip_body_headers) {
+        const char *length = header_get(opt->headers, "Content-Length");
+        const char *encoding = header_get(opt->headers, "Transfer-Encoding");
+        unsigned long long n = 0;
+        if (cl > 1 || te > 1 || (cl && te) ||
+            (length && (parse_decimal(length, LLONG_MAX, &n) ||
+              (opt->body.type == BODY_NONE ? n != 0 : (!opt->body.length_known || n != (unsigned long long)opt->body.length)))) ||
+            (encoding && (!strieq(encoding, "chunked") || opt->body.type == BODY_NONE))) {
+            *err = xstrdup("invalid or conflicting request body framing headers"); return -1;
+        }
+    }
+    if (host_count > 1) { *err = xstrdup("duplicate Host header"); return -1; }
     char *host = url_host_header(u);
     char *absolute = NULL;
     const char *target = u->path;
@@ -259,8 +304,8 @@ static int send_request(Connection *c, const Url *u, const Url *proxy, const Opt
     StrBuf b;
     sb_init(&b);
     sb_printf(&b, "%s %s HTTP/1.1\r\n", method, target);
-    if (!header_exists(opt->headers, "Host")) sb_printf(&b, "Host: %s\r\n", host);
-    if (!header_exists(opt->headers, "User-Agent")) sb_printf(&b, "User-Agent: %s\r\n", opt->user_agent ? opt->user_agent : "frogurl/1.0");
+    if (opt->strip_authorization || !header_exists(opt->headers, "Host")) sb_printf(&b, "Host: %s\r\n", host);
+    if (!header_exists(opt->headers, "User-Agent")) sb_printf(&b, "User-Agent: %s\r\n", opt->user_agent ? opt->user_agent : "frogurl/1.2");
     if (!header_exists(opt->headers, "Accept")) sb_add(&b, "Accept: */*\r\n");
     if (!header_exists(opt->headers, "Connection")) sb_add(&b, "Connection: close\r\n");
     if (opt->compressed && !header_exists(opt->headers, "Accept-Encoding")) sb_add(&b, "Accept-Encoding: gzip, deflate\r\n");
@@ -289,7 +334,10 @@ static int send_request(Connection *c, const Url *u, const Url *proxy, const Opt
         sb_add(&b, "Content-Type: application/x-www-form-urlencoded\r\n");
 
     for (Header *h = opt->headers; h; h = h->next) {
-        if (opt->strip_authorization && strieq(h->name, "Authorization")) continue;
+        if (opt->strip_authorization && (strieq(h->name, "Authorization") || strieq(h->name, "Cookie") || strieq(h->name, "Host"))) continue;
+        if ((!proxy || u->https) && strieq(h->name, "Proxy-Authorization")) continue;
+        if (opt->strip_body_headers && (strieq(h->name, "Content-Length") || strieq(h->name, "Transfer-Encoding") ||
+                                       strieq(h->name, "Content-Type") || strieq(h->name, "Expect"))) continue;
         sb_printf(&b, "%s: %s\r\n", h->name, h->value);
     }
     sb_add(&b, "\r\n");
@@ -298,7 +346,7 @@ static int send_request(Connection *c, const Url *u, const Url *proxy, const Opt
         char *tmp = xstrdup(b.p);
         char *save = NULL;
         for (char *ln = strtok_r(tmp, "\r\n", &save); ln; ln = strtok_r(NULL, "\r\n", &save)) {
-            if (stristarts(ln, "Authorization:") || stristarts(ln, "Proxy-Authorization:"))
+            if (stristarts(ln, "Authorization:") || stristarts(ln, "Proxy-Authorization:") || stristarts(ln, "Cookie:"))
                 fprintf(stderr, "> %.*s: <redacted>\n", (int)(strchr(ln, ':') - ln), ln);
             else fprintf(stderr, "> %s\n", ln);
         }
@@ -316,6 +364,10 @@ static int send_request(Connection *c, const Url *u, const Url *proxy, const Opt
     switch (opt->body.type) {
         case BODY_MEMORY:
             if (chunked_upload) {
+                if (!opt->body.mem_len) {
+                    if (conn_write_all(c, "0\r\n\r\n", 5)) { *err = xstrdup("failed to send empty body"); return -1; }
+                    break;
+                }
                 char head[32];
                 int hn = snprintf(head, sizeof(head), "%zx\r\n", opt->body.mem_len);
                 if (conn_write_all(c, head, (size_t)hn) ||
@@ -328,7 +380,7 @@ static int send_request(Connection *c, const Url *u, const Url *proxy, const Opt
             }
             break;
         case BODY_FILE:
-            return send_file_body(c, opt->body.file_path, chunked_upload, err);
+            return send_file_body(c, opt->body.file_path, chunked_upload, opt->body.length, err);
         case BODY_STDIN:
             if (!chunked_upload) { *err = xstrdup("stdin body requires chunked transfer encoding"); return -1; }
             return send_stdin_body(c, err);
@@ -343,74 +395,17 @@ typedef struct {
     int decompress;
     z_stream zs;
     int zinit;
+    int zend;
+    int gzip;
     long long written;
 } Sink;
 
-typedef struct {
-    int enabled;
-    long long total;
-    long long done;
-    long long start_ms;
-    long long last_ms;
-} Progress;
-
-static void human_bytes(double n, char out[24]) {
-    static const char *u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-    int i = 0;
-    while (n >= 1024.0 && i < 4) { n /= 1024.0; ++i; }
-    if (i == 0) snprintf(out, 24, "%.0f %s", n, u[i]);
-    else if (n >= 100.0) snprintf(out, 24, "%.0f %s", n, u[i]);
-    else if (n >= 10.0) snprintf(out, 24, "%.1f %s", n, u[i]);
-    else snprintf(out, 24, "%.2f %s", n, u[i]);
-}
-
-static void progress_render(Progress *p, int final) {
-    if (!p || !p->enabled) return;
-    long long now = monotonic_ms();
-    if (!final && p->last_ms && now - p->last_ms < 100) return;
-    p->last_ms = now;
-
-    double secs = (now - p->start_ms) / 1000.0;
-    if (secs < 0.001) secs = 0.001;
-    char done[24], total[24], speed[24];
-    human_bytes((double)p->done, done);
-    human_bytes((double)p->done / secs, speed);
-
-    if (p->total > 0) {
-        int pct = (int)((p->done * 100) / p->total);
-        if (pct > 100) pct = 100;
-        const int width = 28;
-        int fill = (pct * width) / 100;
-        char bar[29];
-        for (int i = 0; i < width; ++i) bar[i] = i < fill ? '=' : ' ';
-        if (!final && fill < width) bar[fill] = '>';
-        bar[width] = 0;
-        human_bytes((double)p->total, total);
-        long long eta = 0;
-        if (p->done > 0 && p->done < p->total) eta = (long long)(((p->total - p->done) * secs) / p->done);
-        fprintf(stderr, "\rfrogurl [%s] %3d%%  %s / %s  %s/s  ETA %02lld:%02lld",
-                bar, final ? 100 : pct, done, total, speed, eta / 60, eta % 60);
-    } else {
-        const char spin[] = "|/-\\";
-        unsigned si = (unsigned)((now / 120) & 3);
-        fprintf(stderr, "\rfrogurl [%c] %s  %s/s", spin[si], done, speed);
-    }
-    if (final) fputc('\n', stderr);
-    fflush(stderr);
-}
-
-static void progress_add(Progress *p, size_t n) {
-    if (!p || !p->enabled) return;
-    p->done += (long long)n;
-    progress_render(p, 0);
-}
-
-static int sink_open(Sink *s, const char *path, int gzip, int deflate, int compressed, char **err) {
+static int sink_open(Sink *s, const char *path, int remote_name, int gzip, int deflate, int compressed, char **err) {
     memset(s, 0, sizeof(*s));
     s->fd = STDOUT_FILENO;
     if (path) {
-        s->fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0666);
-        if (s->fd < 0) { *err = fmt_err("cannot open output '%s': %s", path, strerror(errno)); return -1; }
+        s->fd = output_open(path, remote_name, err);
+        if (s->fd < 0) return -1;
         s->own_fd = 1;
     }
     if (compressed && (gzip || deflate)) {
@@ -422,67 +417,60 @@ static int sink_open(Sink *s, const char *path, int gzip, int deflate, int compr
         }
         s->decompress = 1;
         s->zinit = 1;
+        s->gzip = gzip;
     }
     return 0;
 }
 
-static int sink_write(Sink *s, const unsigned char *buf, size_t len, char **err) {
-    if (!s->decompress) {
-        if (write_all_fd(s->fd, buf, len)) { *err = fmt_err("output write failed: %s", strerror(errno)); return -1; }
-        s->written += (long long)len;
-        return 0;
-    }
+static int sink_output(Sink *s, const unsigned char *buf, size_t len, char **err) {
+    if (len > (unsigned long long)(LLONG_MAX - s->written)) { *err = xstrdup("output byte count overflow"); return -1; }
+    if (write_all_fd(s->fd, buf, len)) { *err = fmt_err("output write failed: %s", strerror(errno)); return -1; }
+    s->written += (long long)len; return 0;
+}
 
+static int sink_write(Sink *s, const unsigned char *buf, size_t len, char **err) {
+    if (!s->decompress) return sink_output(s, buf, len, err);
     unsigned char out[16384];
     s->zs.next_in = (Bytef *)buf;
     s->zs.avail_in = (uInt)len;
-    while (s->zs.avail_in) {
-        s->zs.next_out = out;
-        s->zs.avail_out = sizeof(out);
-        int rc = inflate(&s->zs, Z_NO_FLUSH);
-        if (rc != Z_OK && rc != Z_STREAM_END) {
-            *err = fmt_err("compressed response decode failed: %s", s->zs.msg ? s->zs.msg : "zlib error");
-            return -1;
+    for (;;) {
+        if (s->zend) {
+            if (!s->zs.avail_in) break;
+            if (!s->gzip) { *err = xstrdup("trailing data after deflate stream"); return -1; }
+            Bytef *next = s->zs.next_in; uInt avail = s->zs.avail_in;
+            if (inflateReset(&s->zs) != Z_OK) { *err = xstrdup("gzip reset failed"); return -1; }
+            s->zs.next_in = next; s->zs.avail_in = avail; s->zend = 0;
         }
+        s->zs.next_out = out; s->zs.avail_out = sizeof(out);
+        uInt before = s->zs.avail_in;
+        int rc = inflate(&s->zs, Z_NO_FLUSH);
         size_t produced = sizeof(out) - s->zs.avail_out;
-        if (produced && write_all_fd(s->fd, out, produced)) { *err = fmt_err("output write failed: %s", strerror(errno)); return -1; }
-        s->written += (long long)produced;
-        if (rc == Z_STREAM_END) break;
+        if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) {
+            *err = xstrdup("invalid compressed response (data or checksum)"); return -1;
+        }
+        if (produced && sink_output(s, out, produced, err)) return -1;
+        if (rc == Z_STREAM_END) { s->zend = 1; continue; }
+        if (!s->zs.avail_in && s->zs.avail_out) break;
+        if (before == s->zs.avail_in && !produced) { *err = xstrdup("compressed response made no progress"); return -1; }
     }
     return 0;
 }
 
 static int sink_finish(Sink *s, char **err) {
-    if (s->decompress) {
-        unsigned char out[16384];
-        for (;;) {
-            s->zs.next_in = NULL;
-            s->zs.avail_in = 0;
-            s->zs.next_out = out;
-            s->zs.avail_out = sizeof(out);
-            int rc = inflate(&s->zs, Z_FINISH);
-            size_t produced = sizeof(out) - s->zs.avail_out;
-            if (produced && write_all_fd(s->fd, out, produced)) { *err = fmt_err("output write failed: %s", strerror(errno)); return -1; }
-            s->written += (long long)produced;
-            if (rc == Z_STREAM_END || rc == Z_BUF_ERROR) break;
-            if (rc != Z_OK) { *err = xstrdup("compressed response finalization failed"); return -1; }
-        }
-    }
+    if (s->decompress && !s->zend) { *err = xstrdup("truncated compressed response"); return -1; }
     return 0;
 }
 
-static void sink_close(Sink *s) {
+static int sink_close(Sink *s) {
     if (s->zinit) inflateEnd(&s->zs);
-    if (s->own_fd) close(s->fd);
+    return s->own_fd ? close(s->fd) : 0;
 }
 
 static int output_headers(Sink *sink, const Response *r, char **err) {
-    char line[512];
-    int n = snprintf(line, sizeof(line), "HTTP/1.1 %d %s\r\n", r->status, r->reason ? r->reason : "");
-    if (n < 0 || write_all_fd(sink->fd, line, (size_t)n)) {
-        *err = fmt_err("output write failed: %s", strerror(errno));
-        return -1;
-    }
+    char *line = fmt_err("HTTP/1.1 %d %s\r\n", r->status, r->reason ? r->reason : "");
+    int rc = write_all_fd(sink->fd, line, strlen(line));
+    free(line);
+    if (rc) { *err = fmt_err("output write failed: %s", strerror(errno)); return -1; }
     for (Header *h = r->headers; h; h = h->next) {
         size_t need = strlen(h->name) + strlen(h->value) + 5;
         char *hs = xmalloc(need);
@@ -523,14 +511,25 @@ static int read_chunked_body(Connection *c, Sink *sink, Response *r, Progress *p
         errno = 0;
         unsigned long long n = strtoull(line, &end, 16);
         while (end && *end && isspace((unsigned char)*end)) ++end;
-        if (errno || end == line || (end && *end)) { free(line); *err = xstrdup("invalid HTTP chunk size"); return -1; }
+        int valid_hex = end != line;
+        const char *hex_end = semi ? semi : line + strcspn(line, "\r\n");
+        for (const char *p = line; p < hex_end; ++p) if (!isxdigit((unsigned char)*p)) valid_hex = 0;
+        if (errno || !valid_hex || n > LLONG_MAX || (end && *end)) { free(line); *err = xstrdup("invalid HTTP chunk size"); return -1; }
         free(line);
         if (n == 0) {
+            size_t trailer_bytes = 0;
             for (;;) {
                 line = NULL;
                 rr = conn_read_line(c, &line, 65536);
                 if (rr <= 0) { free(line); *err = xstrdup("truncated chunk trailer"); return -1; }
+                trailer_bytes += strlen(line);
+                if (trailer_bytes > 65536) { free(line); *err = xstrdup("HTTP trailers exceed 64 KiB"); return -1; }
                 if (!strcmp(line, "\r\n") || !strcmp(line, "\n")) { free(line); break; }
+                char *colon = strchr(line, ':');
+                if (colon) *colon = 0;
+                if (!colon || !valid_token(line) || strieq(line, "Content-Length") || strieq(line, "Transfer-Encoding")) {
+                    free(line); *err = xstrdup("invalid HTTP trailer"); return -1;
+                }
                 free(line);
             }
             break;
@@ -613,12 +612,12 @@ static int one_transaction(const Url *u, const Url *proxy, const Options *opt, c
         if (!suppress_body && !redirect_suppressed && (opt->include_headers || strieq(method, "HEAD"))) {
             char *hpath = choose_output_path(u, opt);
             Sink hsink;
-            if (sink_open(&hsink, hpath, 0, 0, 0, err) != 0) {
+            if (sink_open(&hsink, hpath, opt->remote_name, 0, 0, 0, err) != 0) {
                 free(hpath); conn_close(&c); return -1;
             }
             free(hpath);
             int hrc = output_headers(&hsink, resp, err);
-            sink_close(&hsink);
+            if (sink_close(&hsink) && !hrc) { *err = xstrdup("output close failed"); hrc = -1; }
             if (hrc) { conn_close(&c); return -1; }
         }
         conn_close(&c);
@@ -628,7 +627,7 @@ static int one_transaction(const Url *u, const Url *proxy, const Options *opt, c
     char *path = choose_output_path(u, opt);
     int output_is_file = path != NULL;
     Sink sink;
-    if (sink_open(&sink, path, resp->gzip, resp->deflate, opt->compressed, err) != 0) {
+    if (sink_open(&sink, path, opt->remote_name, resp->gzip, resp->deflate, opt->compressed, err) != 0) {
         free(path); conn_close(&c); return -1;
     }
     free(path);
@@ -653,15 +652,16 @@ static int one_transaction(const Url *u, const Url *proxy, const Options *opt, c
     else rc = read_to_eof(&c, &sink, resp, &prog, err);
 
     if (!rc && sink_finish(&sink, err)) rc = -1;
-    if (prog.enabled) progress_render(&prog, rc == 0);
+    if (prog.enabled) { if (!rc) progress_render(&prog, 1); else fputc('\n', stderr); }
     resp->body_bytes = sink.written;
-    sink_close(&sink);
+    if (sink_close(&sink) && !rc) { *err = xstrdup("output close failed"); rc = -1; }
     conn_close(&c);
     return rc;
 }
 
 int http_transaction(const Url *url, const Options *opt, Response *resp, char **effective_url, char **err) {
-    if (err) *err = NULL;
+    if (!err) { errno = EINVAL; return -1; }
+    *err = NULL;
     if (effective_url) *effective_url = NULL;
     long long start = monotonic_ms();
     char *current = url_to_string(url);
@@ -675,6 +675,10 @@ int http_transaction(const Url *url, const Options *opt, Response *resp, char **
     memset(&proxy, 0, sizeof(proxy));
     if (opt->proxy) {
         if (url_parse(opt->proxy, &proxy, err) != 0) { free(current); free(method); return -1; }
+        if (!strieq(proxy.scheme, "http")) {
+            url_free(&proxy); free(current); free(method);
+            *err = xstrdup("proxy URL must use http://"); return -1;
+        }
         have_proxy = 1;
     }
 
@@ -685,16 +689,23 @@ int http_transaction(const Url *url, const Options *opt, Response *resp, char **
             free(current); free(method);
             return -1;
         }
+        if (u.ftp) {
+            url_free(&u); if (have_proxy) url_free(&proxy); free(current); free(method);
+            *err = xstrdup("HTTP redirects to FTP are not allowed"); return -1;
+        }
         response_free(resp);
 
         Options ropt = *opt;
-        if (!send_body) memset(&ropt.body, 0, sizeof(ropt.body));
+        if (!send_body) {
+            memset(&ropt.body, 0, sizeof(ropt.body));
+            ropt.strip_body_headers = opt->body.type != BODY_NONE;
+        }
         if (!allow_auth) {
             ropt.basic_auth = NULL;
             ropt.strip_authorization = 1;
         }
 
-        int metadata_only = opt->status_only || opt->meta || opt->json_meta;
+        int metadata_only = (opt->status_only || opt->meta || opt->json_meta) && !opt->output_path && !opt->remote_name;
         if (one_transaction(&u, have_proxy ? &proxy : NULL, &ropt, method, resp,
                             metadata_only, opt->follow_redirects, err) != 0) {
             url_free(&u);
@@ -729,9 +740,8 @@ int http_transaction(const Url *url, const Options *opt, Response *resp, char **
                 free(method);
                 method = xstrdup("GET");
                 send_body = 0;
-            } else if ((resp->status == 307 || resp->status == 308) && send_body &&
-                       opt->body.type == BODY_STDIN) {
-                *err = xstrdup("cannot replay stdin request body across a 307/308 redirect");
+            } else if (send_body && opt->body.type == BODY_STDIN) {
+                *err = xstrdup("cannot replay stdin request body across a redirect");
                 url_free(&nu); free(next); url_free(&u);
                 if (have_proxy) url_free(&proxy);
                 free(current); free(method);
