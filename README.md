@@ -161,6 +161,59 @@ Additional supported long options include:
 
 ---
 
+
+## Download
+
+### Linux x86_64 — v1.1
+
+Download the prebuilt release:
+
+**[frogurl-1.1-linux-x86_64.tar.xz](https://github.com/victormeloasm/frogurl/releases/download/v1.1/frogurl-1.1-linux-x86_64.tar.xz)**
+
+From the command line:
+
+```sh
+curl -L \
+  -o frogurl-1.1-linux-x86_64.tar.xz \
+  https://github.com/victormeloasm/frogurl/releases/download/v1.1/frogurl-1.1-linux-x86_64.tar.xz
+```
+
+or with `wget`:
+
+```sh
+wget \
+  https://github.com/victormeloasm/frogurl/releases/download/v1.1/frogurl-1.1-linux-x86_64.tar.xz
+```
+
+Extract it:
+
+```sh
+tar -xJf frogurl-1.1-linux-x86_64.tar.xz
+```
+
+Install the binary system-wide:
+
+```sh
+sudo install -m 0755 frogurl /usr/local/bin/frogurl
+```
+
+Or install it only for the current user:
+
+```sh
+mkdir -p ~/.local/bin
+install -m 0755 frogurl ~/.local/bin/frogurl
+```
+
+Then try it:
+
+```sh
+frogurl https://example.com
+```
+
+> The prebuilt release targets **Linux x86_64** and dynamically uses the system's libc, OpenSSL, and zlib libraries.
+
+---
+
 ## Dependencies
 
 On Debian/Ubuntu:
