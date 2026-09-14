@@ -208,21 +208,21 @@ fixes and validation. Version 1.2 has not been published to the GitHub release U
 
 Download the prebuilt release:
 
-**[frogurl-1.1-linux-x86_64.tar.xz](https://github.com/victormeloasm/frogurl/releases/download/v1.1/frogurl-1.1-linux-x86_64.tar.xz)**
+**[frogurl-1.1-linux-x86_64.tar.xz](https://github.com/victormeloasm/frogurl/releases/download/v1.2/frogurl-1.2-linux-x86_64.tar.xz)**
 
 From the command line:
 
 ```sh
 curl -L \
   -o frogurl-1.1-linux-x86_64.tar.xz \
-  https://github.com/victormeloasm/frogurl/releases/download/v1.1/frogurl-1.1-linux-x86_64.tar.xz
+  https://github.com/victormeloasm/frogurl/releases/download/v1.2/frogurl-1.2-linux-x86_64.tar.xz
 ```
 
 or with `wget`:
 
 ```sh
 wget \
-  https://github.com/victormeloasm/frogurl/releases/download/v1.1/frogurl-1.1-linux-x86_64.tar.xz
+  https://github.com/victormeloasm/frogurl/releases/download/v1.2/frogurl-1.2-linux-x86_64.tar.xz
 ```
 
 Extract it:
